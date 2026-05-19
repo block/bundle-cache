@@ -118,6 +118,140 @@ func TestHistoryCommits(t *testing.T) {
 	})
 }
 
+func TestResolveCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	ctx := context.Background()
+	repo := t.TempDir()
+
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@test.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	commit := func(msg string) string {
+		t.Helper()
+		run("commit", "--allow-empty", "-m", msg)
+		return run("rev-parse", "HEAD")
+	}
+
+	run("init")
+	run("config", "user.email", "test@test.com")
+	run("config", "user.name", "Test")
+
+	c1 := commit("one")
+	c2 := commit("two")
+	c3 := commit("three")
+	c4 := commit("four")
+	head := c4
+
+	t.Run("single SHA passes through", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, c2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != c2 {
+			t.Fatalf("got %v, want [%s]", got, c2)
+		}
+	})
+
+	t.Run("comma-separated list preserves order", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, c3+","+c1+","+c2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{c3, c1, c2}
+		if !equalSlices(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("A..HEAD walks HEAD back to A exclusive of A", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, c2+"..HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{head, c3}
+		if !equalSlices(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("A^..HEAD includes A", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, c2+"^..HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{head, c3, c2}
+		if !equalSlices(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("range when A equals B is empty", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, head+"..HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("got %v, want []", got)
+		}
+	})
+
+	t.Run("whitespace around items is tolerated", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, " "+c1+" , "+c2+" ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{c1, c2}
+		if !equalSlices(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("range mixed with single in CSV", func(t *testing.T) {
+		got, err := resolveCommits(ctx, repo, c3+"..HEAD,"+c1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{head, c1}
+		if !equalSlices(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("unknown ref in range errors", func(t *testing.T) {
+		if _, err := resolveCommits(ctx, repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef..HEAD"); err == nil {
+			t.Fatal("expected error for unknown anchor")
+		}
+	})
+}
+
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestMergeBase(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

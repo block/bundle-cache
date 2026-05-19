@@ -213,8 +213,11 @@ type RestoreConfig struct {
 	// Ref is the git ref used to search for a base bundle. When Branch is set,
 	// history walks from the merge-base of HEAD and Ref. Defaults to "HEAD".
 	Ref string
-	// Commit is a specific commit SHA to try directly, skipping history walk.
-	Commit string
+	// Commits is a comma-separated list of commit specs to probe in order,
+	// skipping the default history walk. Each item is either a single ref/SHA
+	// or a revspec containing ".." (e.g. "A..HEAD") passed through to
+	// `git rev-list --first-parent`.
+	Commits string
 	// MaxBlocks is the number of distinct-author commit blocks to search. Defaults to 20.
 	MaxBlocks int
 	// GradleUserHome is the path to GRADLE_USER_HOME. Defaults to ~/.gradle.
@@ -317,8 +320,11 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	findStart := time.Now()
 
 	var commits []string
-	if cfg.Commit != "" {
-		commits = []string{cfg.Commit}
+	if cfg.Commits != "" {
+		commits, err = resolveCommits(ctx, cfg.GitDir, cfg.Commits)
+		if err != nil {
+			return errors.Wrap(err, "resolve --commits spec")
+		}
 	} else {
 		ref := cfg.Ref
 		// When restoring on a branch (PR), resolve the merge-base between HEAD

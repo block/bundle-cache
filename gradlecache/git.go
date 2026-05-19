@@ -62,6 +62,50 @@ func historyCommits(ctx context.Context, gitDir, ref string, maxBlocks int) ([]s
 	return commits, errors.Wrap(scanner.Err(), "scan git log")
 }
 
+// resolveCommits expands a --commits spec into an ordered candidate list.
+// The spec is a comma-separated list of items, each of which is either:
+//   - a single ref/SHA, included as-is, or
+//   - any revspec containing "..", passed through to `git rev-list
+//     --first-parent` (e.g. "A..HEAD", "A..feature", "A^..HEAD").
+func resolveCommits(ctx context.Context, gitDir, spec string) ([]string, error) {
+	var out []string
+	for _, raw := range strings.Split(spec, ",") {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		if strings.Contains(item, "..") {
+			commits, err := revListFirstParent(ctx, gitDir, item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, commits...)
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+// revListFirstParent runs `git rev-list --first-parent <revspec>` and returns
+// the resulting commit SHAs in the order git emits them (newest first).
+func revListFirstParent(ctx context.Context, gitDir, revspec string) ([]string, error) {
+	//nolint:gosec
+	cmd := exec.CommandContext(ctx, "git", "-C", gitDir, "rev-list", "--first-parent", revspec, "--")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, errors.Errorf("git rev-list %s: %w", revspec, err)
+	}
+	var commits []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			commits = append(commits, line)
+		}
+	}
+	return commits, nil
+}
+
 func branchSlug(branch string) string {
 	s := strings.ReplaceAll(branch, "/", "--")
 	var b strings.Builder
