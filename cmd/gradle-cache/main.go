@@ -91,7 +91,7 @@ type RestoreCmd struct {
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	GitDir         string   `help:"Path to the git repository used for history walking." default:"." type:"path" hidden:""`
 	Ref            string   `help:"Git ref used to search for a base bundle. When --branch is set, history walks from the merge-base of HEAD and this ref." default:"HEAD"`
-	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
+	Commits        string   `help:"Comma-separated list of commit specs to probe, skipping history walk. Each item is either a SHA/ref or a git revspec containing '..' (e.g. 'A..HEAD'), expanded via 'git rev-list --first-parent'."`
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory containing included builds and .gradle/." default:"." type:"path"`
@@ -116,7 +116,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient)
 		CacheKey:       c.CacheKey,
 		GitDir:         c.GitDir,
 		Ref:            c.Ref,
-		Commit:         c.Commit,
+		Commits:        c.Commits,
 		MaxBlocks:      c.MaxBlocks,
 		GradleUserHome: c.GradleUserHome,
 		ProjectDir:     c.ProjectDir,
