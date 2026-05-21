@@ -225,6 +225,10 @@ func processEntry(
 		return err
 	}
 
+	if name == deltaBaseCommitEntry {
+		return nil
+	}
+
 	target := targetFn(name)
 
 	switch hdr.Typeflag {

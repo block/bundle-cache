@@ -63,8 +63,9 @@ func newS3Client(region string) (*s3Client, error) {
 }
 
 type s3ObjInfo struct {
-	Size int64
-	ETag string
+	Size     int64
+	ETag     string
+	Metadata map[string]string
 }
 
 func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, error) {
@@ -82,10 +83,23 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, err
 	if resp.StatusCode != http.StatusOK {
 		return s3ObjInfo{}, errors.Errorf("status %d", resp.StatusCode)
 	}
-	return s3ObjInfo{
+	info := s3ObjInfo{
 		Size: resp.ContentLength,
 		ETag: resp.Header.Get("ETag"),
-	}, nil
+	}
+	// net/http canonicalizes response header keys, so user metadata always
+	// arrives as "X-Amz-Meta-<name>". Collect it keyed by lowercased name.
+	for k, vs := range resp.Header {
+		name, ok := strings.CutPrefix(k, "X-Amz-Meta-")
+		if !ok || len(vs) == 0 {
+			continue
+		}
+		if info.Metadata == nil {
+			info.Metadata = make(map[string]string)
+		}
+		info.Metadata[strings.ToLower(name)] = vs[0]
+	}
+	return info, nil
 }
 
 func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) (io.ReadCloser, error) {

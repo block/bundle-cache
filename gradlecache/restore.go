@@ -386,6 +386,13 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 				deltaCh <- deltaResult{}
 				return
 			}
+			// Check S3 metadata for base-commit mismatch before downloading.
+			if metaBase := deltaInfo.Metadata[deltaBaseCommitMetaKey]; metaBase != "" && metaBase != hitCommit {
+				logBaseMismatch(log, "built on different base", metaBase, hitCommit)
+				deltaCh <- deltaResult{}
+				return
+			}
+
 			log.Info("downloading delta bundle", "branch", cfg.Branch)
 			dlStart := time.Now()
 			body, err := store.get(ctx, dc, cfg.CacheKey, deltaInfo)
@@ -412,6 +419,17 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 				deltaCh <- deltaResult{err: errors.Wrap(err, "rewind delta temp file")}
 				return
 			}
+
+			// Check tar stamp for base-commit mismatch (covers stores without metadata).
+			tarBase, tarErr := ReadDeltaBaseCommit(tmp)
+			if tarErr == nil && tarBase != "" && tarBase != hitCommit {
+				logBaseMismatch(log, "tar stamp shows different base", tarBase, hitCommit)
+				tmp.Close()           //nolint:errcheck,gosec
+				os.Remove(tmp.Name()) //nolint:errcheck,gosec
+				deltaCh <- deltaResult{}
+				return
+			}
+
 			deltaCh <- deltaResult{tmpFile: tmp, dlStart: dlStart, n: cb.n, eofAt: cb.eofAt}
 		}()
 	}
@@ -487,6 +505,10 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 		dlElapsed := cb.eofAt.Sub(dlStart)
 		mbps := float64(cb.n) / dlElapsed.Seconds() / 1e6
 		cfg.Metrics.Distribution("gradle_cache.restore_base.speed_mbps", mbps, "cache_key:"+cfg.CacheKey)
+	}
+
+	if err := writeBaseCommitFile(cfg.GradleUserHome, hitCommit); err != nil {
+		log.Warn("could not write base commit file", "err", err)
 	}
 
 	if err := touchMarkerFile(filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")); err != nil {
