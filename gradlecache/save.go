@@ -22,6 +22,80 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+const (
+	// baseCommitFile is written to GRADLE_USER_HOME after a base restore so
+	// that delta save can stamp the delta with the base it was built on.
+	baseCommitFile = ".cache-base-commit"
+
+	// deltaBaseCommitMetaKey is the S3 user-metadata key used to stamp a
+	// delta bundle with the base commit it was built against.
+	deltaBaseCommitMetaKey = "base-commit"
+
+	// deltaBaseCommitEntry is a synthetic tar entry prepended to delta
+	// bundles carrying the base commit SHA. It is skipped during extraction.
+	deltaBaseCommitEntry = "__base_commit__"
+)
+
+// shortSHA returns the first 8 characters of a SHA for logging.
+func shortSHA(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
+}
+
+// logBaseMismatch logs that a delta was skipped because its base differs.
+func logBaseMismatch(log *slog.Logger, reason, deltaBase, currentBase string) {
+	log.Info("skipping delta: "+reason,
+		"delta_base", shortSHA(deltaBase),
+		"current_base", shortSHA(currentBase))
+}
+
+func writeBaseCommitFile(gradleHome, sha string) error {
+	path := filepath.Join(gradleHome, baseCommitFile)
+	return os.WriteFile(path, []byte(sha+"\n"), 0o600)
+}
+
+func readBaseCommitFile(gradleHome string) (string, error) {
+	path := filepath.Join(gradleHome, baseCommitFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(string(data))
+	if !IsFullSHA(sha) {
+		return "", errors.Errorf("invalid SHA in %s: %q", path, sha)
+	}
+	return sha, nil
+}
+
+// ReadDeltaBaseCommit reads the __base_commit__ stamp from a delta bundle.
+// r must be a zstd-compressed tar. After reading, r is seeked back to the start.
+// Returns ("", nil) if no stamp is found.
+func ReadDeltaBaseCommit(r io.ReadSeeker) (sha string, err error) {
+	defer func() {
+		if _, seekErr := r.Seek(0, io.SeekStart); err == nil {
+			err = seekErr
+		}
+	}()
+	dec, err := zstd.NewReader(r)
+	if err != nil {
+		return "", err
+	}
+	defer dec.Close()
+
+	tr := tar.NewReader(dec)
+	hdr, err := tr.Next()
+	if err != nil || hdr.Name != deltaBaseCommitEntry {
+		return "", nil // unstamped delta
+	}
+	data, err := io.ReadAll(tr)
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 // RestoreDeltaConfig holds the parameters for a delta restore operation.
 type RestoreDeltaConfig struct {
 	Bucket         string
@@ -80,6 +154,20 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 	}
 	log.Info("found delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey)
 
+	// Check metadata-level base-commit stamp against local base.
+	localBase, localBaseErr := readBaseCommitFile(cfg.GradleUserHome)
+	metaBase := deltaInfo.Metadata[deltaBaseCommitMetaKey]
+	if metaBase != "" && localBaseErr != nil {
+		// Delta is stamped but we don't know what base we restored.
+		// Skip to avoid cross-base contamination.
+		log.Info("skipping stamped delta: local base commit unknown", "err", localBaseErr)
+		return nil
+	}
+	if metaBase != "" && metaBase != localBase {
+		logBaseMismatch(log, "built on different base", metaBase, localBase)
+		return nil
+	}
+
 	dlStart := time.Now()
 	body, err := store.get(ctx, dc, cfg.CacheKey, deltaInfo)
 	if err != nil {
@@ -93,7 +181,33 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 	}
 
 	cb := &countingBody{r: body, dlStart: dlStart}
-	if err := extractDeltaTarZstd(ctx, cb, cfg.GradleUserHome, pdSources); err != nil {
+	var extractSrc io.Reader = cb
+
+	// When the store lacks metadata (e.g. cachew) but we know our base, buffer
+	// the delta so the embedded tar stamp can be checked before extracting.
+	if metaBase == "" && localBaseErr == nil {
+		tmp, err := os.CreateTemp("", "gradle-cache-delta-check-*")
+		if err != nil {
+			return errors.Wrap(err, "create delta temp file")
+		}
+		defer func() {
+			tmp.Close()           //nolint:errcheck,gosec
+			os.Remove(tmp.Name()) //nolint:errcheck,gosec
+		}()
+		if _, err := io.Copy(tmp, cb); err != nil {
+			return errors.Wrap(err, "buffer delta bundle")
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			return errors.Wrap(err, "rewind delta temp file")
+		}
+		if tarBase, tarErr := ReadDeltaBaseCommit(tmp); tarErr == nil && tarBase != "" && tarBase != localBase {
+			logBaseMismatch(log, "tar stamp shows different base", tarBase, localBase)
+			return nil
+		}
+		extractSrc = tmp
+	}
+
+	if err := extractDeltaTarZstd(ctx, extractSrc, cfg.GradleUserHome, pdSources); err != nil {
 		return errors.Wrap(err, "extract delta bundle")
 	}
 
@@ -102,6 +216,8 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 		log.Info("delta download complete", "duration", dlElapsed.Round(time.Millisecond),
 			"size_mb", fmt.Sprintf("%.1f", float64(cb.n)/1e6),
 			"speed_mbps", fmt.Sprintf("%.1f", float64(cb.n)/dlElapsed.Seconds()/1e6))
+		cfg.Metrics.Distribution("gradle_cache.restore_delta.speed_mbps",
+			float64(cb.n)/dlElapsed.Seconds()/1e6, "cache_key:"+cfg.CacheKey)
 	}
 	deltaElapsed := time.Since(dlStart)
 	log.Info("applied delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey,
@@ -110,12 +226,6 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 		"cache_key:"+cfg.CacheKey)
 	cfg.Metrics.Distribution("gradle_cache.restore_delta.size_bytes", float64(cb.n),
 		"cache_key:"+cfg.CacheKey)
-	if !cb.eofAt.IsZero() {
-		dlElapsed := cb.eofAt.Sub(dlStart)
-		mbps := float64(cb.n) / dlElapsed.Seconds() / 1e6
-		cfg.Metrics.Distribution("gradle_cache.restore_delta.speed_mbps", mbps,
-			"cache_key:"+cfg.CacheKey)
-	}
 	return nil
 }
 
@@ -383,8 +493,15 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 	log.Info("saving delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey, "files", totalFiles)
 	saveStart := time.Now()
 
+	// Read the base commit that this delta was built on top of.
+	baseCommit, err := readBaseCommitFile(cfg.GradleUserHome)
+	if err != nil {
+		log.Warn("could not read base commit file, skipping delta save", "err", err)
+		return nil
+	}
+
 	sources := append([]DeltaSource{{BaseDir: cfg.GradleUserHome, RelPaths: newFiles}}, projectSources...)
-	if err := CreateDeltaTarZstdMulti(tmp, sources...); err != nil {
+	if err := createDeltaTarZstd(tmp, baseCommit, sources...); err != nil {
 		return errors.Wrap(err, "create delta archive")
 	}
 
@@ -396,7 +513,8 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 		return errors.Wrap(err, "rewind delta bundle")
 	}
 
-	if err := store.put(ctx, dc, cfg.CacheKey, tmp, size); err != nil {
+	meta := map[string]string{deltaBaseCommitMetaKey: baseCommit}
+	if err := store.put(ctx, dc, cfg.CacheKey, tmp, size, meta); err != nil {
 		return errors.Wrap(err, "upload delta bundle")
 	}
 
@@ -766,13 +884,20 @@ func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths
 
 // CreateDeltaTarZstdMulti creates a zstd-compressed tar archive from multiple sources.
 func CreateDeltaTarZstdMulti(w io.Writer, sources ...DeltaSource) error {
+	return createDeltaTarZstd(w, "", sources...)
+}
+
+// createDeltaTarZstd creates a zstd-compressed tar archive from multiple sources.
+// If baseCommit is non-empty, a synthetic __base_commit__ entry holding the base
+// commit SHA is written as the first archive entry.
+func createDeltaTarZstd(w io.Writer, baseCommit string, sources ...DeltaSource) error {
 	enc, err := zstd.NewWriter(w,
 		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Wrap(err, "create zstd encoder")
 	}
 
-	tarErr := WriteDeltaTarMulti(enc, sources...)
+	tarErr := writeDeltaTar(enc, baseCommit, sources...)
 	encErr := enc.Close()
 
 	return errors.Join(tarErr, encErr)
@@ -785,7 +910,27 @@ func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
 
 // WriteDeltaTarMulti writes a tar stream for files from multiple source directories.
 func WriteDeltaTarMulti(w io.Writer, sources ...DeltaSource) error {
+	return writeDeltaTar(w, "", sources...)
+}
+
+// writeDeltaTar writes a tar stream for files from multiple source directories.
+// If baseCommit is non-empty, a synthetic __base_commit__ entry holding the base
+// commit SHA is written as the first entry.
+func writeDeltaTar(w io.Writer, baseCommit string, sources ...DeltaSource) error {
 	tw := tar.NewWriter(w)
+	if baseCommit != "" {
+		content := []byte(baseCommit + "\n")
+		if err := tw.WriteHeader(&tar.Header{
+			Name: deltaBaseCommitEntry,
+			Size: int64(len(content)),
+			Mode: 0o644,
+		}); err != nil {
+			return errors.Wrap(err, "write base-commit tar header")
+		}
+		if _, err := tw.Write(content); err != nil {
+			return errors.Wrap(err, "write base-commit tar content")
+		}
+	}
 	for _, src := range sources {
 		for _, rel := range src.RelPaths {
 			if err := writeDeltaTarEntry(tw, src.BaseDir, rel); err != nil {

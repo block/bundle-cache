@@ -329,7 +329,7 @@ func (g *ghaCacheStore) createAndFinalize(ctx context.Context, commit, cacheKey 
 // put uploads a cache entry from a ReadSeeker of known size.
 // For small bundles (≤ 1 block), uses a single PUT. For larger bundles,
 // uses parallel Azure Block Blob upload (Put Block + Put Block List).
-func (g *ghaCacheStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error {
+func (g *ghaCacheStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64, _ map[string]string) error {
 	return g.createAndFinalize(ctx, commit, cacheKey, size, func(signedURL string) error {
 		if size <= ghaBlockSize {
 			return g.azurePutSingle(ctx, signedURL, r, size)

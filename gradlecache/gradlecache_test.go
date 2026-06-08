@@ -806,6 +806,67 @@ func TestDeltaTarZstdRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStampedDeltaRoundTrip(t *testing.T) {
+	baseCommit := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	gradleHome := t.TempDir()
+	cachesDir := filepath.Join(gradleHome, "caches", "modules-2")
+	must(t, os.MkdirAll(cachesDir, 0o755))
+	must(t, os.WriteFile(filepath.Join(cachesDir, "delta-file.bin"), []byte("delta"), 0o644))
+
+	// Create a stamped delta archive.
+	var buf bytes.Buffer
+	must(t, createDeltaTarZstd(&buf, baseCommit,
+		DeltaSource{BaseDir: gradleHome, RelPaths: []string{"caches/modules-2/delta-file.bin"}}))
+
+	// ReadDeltaBaseCommit should return the embedded stamp.
+	r := bytes.NewReader(buf.Bytes())
+	got, err := ReadDeltaBaseCommit(r)
+	must(t, err)
+	if got != baseCommit {
+		t.Fatalf("ReadDeltaBaseCommit = %q, want %q", got, baseCommit)
+	}
+
+	// The file should still extract correctly (stamp entry is skipped).
+	dstDir := t.TempDir()
+	must(t, extractTarZstd(context.Background(), bytes.NewReader(buf.Bytes()), dstDir))
+
+	data, err := os.ReadFile(filepath.Join(dstDir, "caches", "modules-2", "delta-file.bin"))
+	must(t, err)
+	if string(data) != "delta" {
+		t.Fatalf("extracted content = %q, want %q", string(data), "delta")
+	}
+
+	// __base_commit__ should NOT exist as a file on disk.
+	if _, err := os.Stat(filepath.Join(dstDir, deltaBaseCommitEntry)); err == nil {
+		t.Fatal("__base_commit__ should not be extracted as a real file")
+	}
+}
+
+func TestReadDeltaBaseCommitMissing(t *testing.T) {
+	// An unstamped delta should return empty string.
+	var buf bytes.Buffer
+	must(t, CreateDeltaTarZstdMulti(&buf,
+		DeltaSource{BaseDir: t.TempDir(), RelPaths: nil}))
+
+	r := bytes.NewReader(buf.Bytes())
+	got, err := ReadDeltaBaseCommit(r)
+	must(t, err)
+	if got != "" {
+		t.Fatalf("ReadDeltaBaseCommit on unstamped delta = %q, want empty", got)
+	}
+}
+
+func TestBaseCommitFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	sha := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	must(t, writeBaseCommitFile(dir, sha))
+	got, err := readBaseCommitFile(dir)
+	must(t, err)
+	if got != sha {
+		t.Fatalf("readBaseCommitFile = %q, want %q", got, sha)
+	}
+}
+
 func TestSaveDeltaDefaultsProjectDirToWorkingDirectory(t *testing.T) {
 	ctx := context.Background()
 	gradleHome := t.TempDir()
@@ -817,6 +878,8 @@ func TestSaveDeltaDefaultsProjectDirToWorkingDirectory(t *testing.T) {
 
 	markerPath := filepath.Join(gradleHome, ".cache-restore-marker")
 	must(t, touchMarkerFile(markerPath))
+	// Write a base commit file so SaveDelta can stamp the delta.
+	must(t, writeBaseCommitFile(gradleHome, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 
 	// Sleep to ensure files created below have a strictly newer mtime than
 	// the marker. On Linux ext4 the mtime granularity is 1 ms, but rapid

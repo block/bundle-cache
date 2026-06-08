@@ -21,15 +21,16 @@ import (
 
 // bundleStatInfo holds opaque metadata returned by bundleStore.stat().
 type bundleStatInfo struct {
-	Size int64
-	etag string
+	Size     int64
+	etag     string
+	Metadata map[string]string // user-defined metadata (e.g. base-commit for deltas)
 }
 
 // bundleStore abstracts over S3 and cachew as storage backends.
 type bundleStore interface {
 	stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error)
 	get(ctx context.Context, commit, cacheKey string, info bundleStatInfo) (io.ReadCloser, error)
-	put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error
+	put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64, meta map[string]string) error
 	putStream(ctx context.Context, commit, cacheKey string, r io.Reader) (int64, error)
 }
 
@@ -62,15 +63,15 @@ func (s *s3BundleStore) stat(ctx context.Context, commit, cacheKey string) (bund
 	if err != nil {
 		return bundleStatInfo{}, err
 	}
-	return bundleStatInfo{Size: obj.Size, etag: obj.ETag}, nil
+	return bundleStatInfo{Size: obj.Size, etag: obj.ETag, Metadata: obj.Metadata}, nil
 }
 
 func (s *s3BundleStore) get(ctx context.Context, commit, cacheKey string, info bundleStatInfo) (io.ReadCloser, error) {
 	return s.client.get(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), s3ObjInfo{Size: info.Size, ETag: info.etag})
 }
 
-func (s *s3BundleStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error {
-	return s.client.put(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), r, size, "application/zstd")
+func (s *s3BundleStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64, meta map[string]string) error {
+	return s.client.put(ctx, s.bucket, s3Key(s.keyPrefix, commit, cacheKey, bundleFilename(cacheKey)), r, size, "application/zstd", meta)
 }
 
 func (s *s3BundleStore) putStream(ctx context.Context, commit, cacheKey string, r io.Reader) (int64, error) {
@@ -148,7 +149,7 @@ func (c *cachewClient) get(ctx context.Context, commit, cacheKey string, _ bundl
 	return resp.Body, nil
 }
 
-func (c *cachewClient) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error {
+func (c *cachewClient) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64, _ map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.objectURL(commit, cacheKey), r)
 	if err != nil {
 		return err
@@ -207,11 +208,11 @@ const (
 	uploadWorkers  = 8
 )
 
-func (c *s3Client) put(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
+func (c *s3Client) put(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string, meta map[string]string) error {
 	if size <= uploadPartSize {
-		return c.putSingle(ctx, bucket, key, r, size, contentType)
+		return c.putSingle(ctx, bucket, key, r, size, contentType, meta)
 	}
-	return c.putMultipart(ctx, bucket, key, r, size, contentType)
+	return c.putMultipart(ctx, bucket, key, r, size, contentType, meta)
 }
 
 // crc64Of computes a CRC64-NVME checksum of the data from r, then seeks back.
@@ -233,7 +234,7 @@ func crc64Base64(h hash.Hash64) string {
 	return base64.StdEncoding.EncodeToString(buf[:])
 }
 
-func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
+func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string, meta map[string]string) error {
 	checksum, err := crc64Of(r)
 	if err != nil {
 		return errors.Wrap(err, "compute CRC64-NVME checksum")
@@ -248,6 +249,9 @@ func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadS
 	}
 	req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
 	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
+	for k, v := range meta {
+		req.Header.Set("X-Amz-Meta-"+k, v)
+	}
 	c.sign(req)
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
@@ -261,8 +265,8 @@ func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadS
 	return nil
 }
 
-func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
-	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType)
+func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string, meta map[string]string) error {
+	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType, meta)
 	if err != nil {
 		return err
 	}
@@ -329,7 +333,7 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 	return c.completeMultipartUpload(ctx, bucket, key, uploadID, parts)
 }
 
-func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, contentType string) (string, error) {
+func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, contentType string, meta map[string]string) (string, error) {
 	u := c.objectURL(bucket, key) + "?uploads"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
@@ -339,6 +343,9 @@ func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, conte
 		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
+	for k, v := range meta {
+		req.Header.Set("X-Amz-Meta-"+k, v)
+	}
 	c.sign(req)
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
@@ -440,7 +447,7 @@ func (c *s3Client) abortMultipartUpload(ctx context.Context, bucket, key, upload
 }
 
 func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string, r io.Reader, contentType string) (int64, error) {
-	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType)
+	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType, nil)
 	if err != nil {
 		return 0, err
 	}
