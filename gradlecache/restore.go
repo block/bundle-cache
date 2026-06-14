@@ -229,6 +229,10 @@ type RestoreConfig struct {
 	IncludedBuilds []string
 	// Branch is an optional branch name to also apply a delta bundle for.
 	Branch string
+	// RawBranch disables branch-name sanitization (slug) when computing the
+	// delta bundle's S3 path. Default false preserves the existing slug behavior
+	// (e.g. "feature/foo" → "feature--foo"); set true to use the branch as-is.
+	RawBranch bool
 	// Metrics is an optional metrics client. If nil, a no-op client is used.
 	Metrics MetricsClient
 	// Logger is an optional structured logger. If nil, slog.Default() is used.
@@ -379,7 +383,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	if cfg.Branch != "" {
 		deltaCh = make(chan deltaResult, 1)
 		go func() {
-			dc := deltaCommit(cfg.Branch)
+			dc := deltaCommit(cfg.Branch, cfg.RawBranch)
 			deltaInfo, statErr := store.stat(ctx, dc, cfg.CacheKey)
 			if statErr != nil {
 				log.Info("no delta bundle found for branch", "branch", cfg.Branch)

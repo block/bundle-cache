@@ -97,6 +97,7 @@ type RestoreCmd struct {
 	ProjectDir     string   `help:"Project directory containing included builds and .gradle/." default:"." type:"path"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to restore. May be repeated." name:"included-build"`
 	Branch         string   `help:"Branch name to also apply a delta bundle for." optional:""`
+	RawBranch      bool     `help:"Use the branch name as-is when computing the delta S3 path, instead of sanitizing slashes and special characters."`
 }
 
 func (c *RestoreCmd) AfterApply() error {
@@ -122,6 +123,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient)
 		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
 		Branch:         c.Branch,
+		RawBranch:      c.RawBranch,
 		Metrics:        metrics,
 	})
 }
@@ -132,6 +134,7 @@ type RestoreDeltaCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Branch         string   `help:"Branch name to look up a delta for." required:""`
+	RawBranch      bool     `help:"Use the branch name as-is when computing the delta S3 path, instead of sanitizing slashes and special characters."`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory for routing project-specific cache entries." type:"path"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build"`
@@ -153,6 +156,7 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsCl
 		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
+		RawBranch:      c.RawBranch,
 		GradleUserHome: c.GradleUserHome,
 		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
@@ -202,6 +206,7 @@ type SaveDeltaCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Branch         string   `help:"Branch name to save the delta under." required:""`
+	RawBranch      bool     `help:"Use the branch name as-is when computing the delta S3 path, instead of sanitizing slashes and special characters."`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory to scan for project-specific cache changes." type:"path"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build"`
@@ -223,6 +228,7 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClien
 		KeyPrefix:      c.KeyPrefix,
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
+		RawBranch:      c.RawBranch,
 		GradleUserHome: c.GradleUserHome,
 		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,

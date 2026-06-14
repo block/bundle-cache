@@ -104,6 +104,7 @@ type RestoreDeltaConfig struct {
 	KeyPrefix      string
 	CacheKey       string
 	Branch         string
+	RawBranch      bool
 	GradleUserHome string
 	ProjectDir     string   // optional: route project-dir entries to their correct locations
 	IncludedBuilds []string // included build directories (for convention plugin outputs)
@@ -146,7 +147,7 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 		return err
 	}
 
-	dc := deltaCommit(cfg.Branch)
+	dc := deltaCommit(cfg.Branch, cfg.RawBranch)
 	deltaInfo, err := store.stat(ctx, dc, cfg.CacheKey)
 	if err != nil {
 		log.Info("no delta bundle found for branch", "branch", cfg.Branch, "cache-key", cfg.CacheKey)
@@ -388,6 +389,7 @@ type SaveDeltaConfig struct {
 	KeyPrefix      string
 	CacheKey       string
 	Branch         string
+	RawBranch      bool
 	GradleUserHome string
 	ProjectDir     string   // optional: scan project-dir sources for new entries
 	IncludedBuilds []string // included build directories (for convention plugin outputs)
@@ -489,7 +491,7 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 	}()
 
 	totalFiles := len(newFiles) + projectFileCount
-	dc := deltaCommit(cfg.Branch)
+	dc := deltaCommit(cfg.Branch, cfg.RawBranch)
 	log.Info("saving delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey, "files", totalFiles)
 	saveStart := time.Now()
 

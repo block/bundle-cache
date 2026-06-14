@@ -717,14 +717,18 @@ func TestBranchSlug(t *testing.T) {
 
 func TestDeltaCommit(t *testing.T) {
 	tests := []struct {
-		branch, want string
+		branch string
+		raw    bool
+		want   string
 	}{
-		{"main", "branches/main"},
-		{"feature/my-pr", "branches/feature--my-pr"},
+		{"main", false, "branches/main"},
+		{"feature/my-pr", false, "branches/feature--my-pr"},
+		{"feature/my-pr", true, "branches/feature/my-pr"},
+		{"a#b?c", true, "branches/a#b?c"},
 	}
 	for _, tt := range tests {
-		if got := deltaCommit(tt.branch); got != tt.want {
-			t.Errorf("deltaCommit(%q) = %q, want %q", tt.branch, got, tt.want)
+		if got := deltaCommit(tt.branch, tt.raw); got != tt.want {
+			t.Errorf("deltaCommit(%q, raw=%v) = %q, want %q", tt.branch, tt.raw, got, tt.want)
 		}
 	}
 }

@@ -121,6 +121,12 @@ func branchSlug(branch string) string {
 	return b.String()
 }
 
-func deltaCommit(branch string) string {
+// deltaCommit builds the synthetic "commit" used as the S3 path component for a
+// branch delta bundle. When raw is true, the branch is used as-is; otherwise
+// branchSlug is applied to escape path separators and special characters.
+func deltaCommit(branch string, raw bool) string {
+	if raw {
+		return "branches/" + branch
+	}
 	return "branches/" + branchSlug(branch)
 }
