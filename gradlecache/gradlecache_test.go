@@ -694,33 +694,13 @@ func TestTarZstdSymlinkDereference(t *testing.T) {
 	}
 }
 
-// ─── branchSlug tests ────────────────────────────────────────────────────────
-
-func TestBranchSlug(t *testing.T) {
-	tests := []struct {
-		input, want string
-	}{
-		{"main", "main"},
-		{"feature/my-pr", "feature--my-pr"},
-		{"fix/JIRA-123", "fix--JIRA-123"},
-		{"refs/heads/main", "refs--heads--main"},
-		{"branch with spaces", "branch-with-spaces"},
-		{"a#b?c&d", "a-b-c-d"},
-		{"feature/foo/bar", "feature--foo--bar"},
-	}
-	for _, tt := range tests {
-		if got := branchSlug(tt.input); got != tt.want {
-			t.Errorf("branchSlug(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
 func TestDeltaCommit(t *testing.T) {
 	tests := []struct {
 		branch, want string
 	}{
 		{"main", "branches/main"},
-		{"feature/my-pr", "branches/feature--my-pr"},
+		{"feature/my-pr", "branches/feature/my-pr"},
+		{"a#b?c", "branches/a#b?c"},
 	}
 	for _, tt := range tests {
 		if got := deltaCommit(tt.branch); got != tt.want {
