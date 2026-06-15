@@ -106,21 +106,9 @@ func revListFirstParent(ctx context.Context, gitDir, revspec string) ([]string, 
 	return commits, nil
 }
 
-func branchSlug(branch string) string {
-	s := strings.ReplaceAll(branch, "/", "--")
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-			r == '-', r == '_', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return b.String()
-}
-
+// deltaCommit builds the synthetic "commit" used as the S3 path component for
+// a branch delta bundle. The branch name is used verbatim; / separators flow
+// through as S3 path segments.
 func deltaCommit(branch string) string {
-	return "branches/" + branchSlug(branch)
+	return "branches/" + branch
 }
