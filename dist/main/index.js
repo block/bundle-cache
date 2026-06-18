@@ -33525,6 +33525,7 @@ module.exports = {
 const core = __nccwpck_require__(7484);
 const exec = __nccwpck_require__(5236);
 const tc = __nccwpck_require__(3472);
+const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
 
@@ -33664,6 +33665,41 @@ function resolveBranch() {
   return "";
 }
 
+/**
+ * Read the repository's default branch from the GitHub event payload.
+ * Returns "HEAD" when it can't be determined.
+ */
+function defaultBranch() {
+  try {
+    const eventPath = process.env.GITHUB_EVENT_PATH;
+    if (eventPath) {
+      const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+      if (event.repository && event.repository.default_branch) {
+        return event.repository.default_branch;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return "HEAD";
+}
+
+/**
+ * True when this run is a push build of the repository's default branch.
+ * These builds publish a fresh full ("base") bundle and never restore, so the
+ * bundle doesn't grow without bound across commits. Branches and PRs restore
+ * the base and publish a delta.
+ */
+function isDefaultBranchBuild() {
+  const event = process.env.GITHUB_EVENT_NAME || "";
+  if (event === "pull_request" || event === "pull_request_target") {
+    return false;
+  }
+  const def = defaultBranch();
+  const refName = process.env.GITHUB_REF_NAME || "";
+  return def !== "HEAD" && refName === def;
+}
+
 module.exports = {
   install,
   backendArgs,
@@ -33673,6 +33709,8 @@ module.exports = {
   gitDirArgs,
   execOptions,
   resolveBranch,
+  defaultBranch,
+  isDefaultBranchBuild,
 };
 
 
@@ -33997,7 +34035,6 @@ module.exports = require("util");
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
-const fs = __nccwpck_require__(9896);
 const core = __nccwpck_require__(7484);
 const exec = __nccwpck_require__(5236);
 const {
@@ -34008,25 +34045,23 @@ const {
   gitDirArgs,
   execOptions,
   resolveBranch,
+  defaultBranch,
+  isDefaultBranchBuild,
 } = __nccwpck_require__(6636);
-
-function defaultBranch() {
-  try {
-    const eventPath = process.env.GITHUB_EVENT_PATH;
-    if (eventPath) {
-      const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
-      if (event.repository && event.repository.default_branch) {
-        return event.repository.default_branch;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return "HEAD";
-}
 
 async function run() {
   try {
+    // Always persist save inputs so the post step runs regardless of restore.
+    core.saveState("cache-key", core.getInput("cache-key"));
+    core.saveState("save", core.getInput("save"));
+
+    if (isDefaultBranchBuild()) {
+      core.info(
+        "Cache restore skipped — default-branch build publishes a fresh base bundle",
+      );
+      return;
+    }
+
     const args = [
       "restore",
       ...commonArgs(),
@@ -34050,10 +34085,6 @@ async function run() {
     if (exitCode !== 0) {
       core.warning("Cache restore failed; proceeding without cache");
     }
-
-    // Save inputs for the post step
-    core.saveState("cache-key", core.getInput("cache-key"));
-    core.saveState("save", core.getInput("save"));
   } catch (error) {
     core.warning(`Cache restore failed: ${error.message}`);
   }
