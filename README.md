@@ -51,12 +51,17 @@ The post-step runs automatically during job cleanup — you don't need to add a
 separate save step. It runs even if your build fails, so partial caches are
 still preserved for the next run.
 
-On **pull requests**, the action automatically uses delta caches: it restores
-the base bundle by walking history from the **merge-base** of the PR branch and
-the default branch, applies any existing branch delta on top, and after the
-build only saves the files that changed. On **pushes to the default branch**,
-it saves a full bundle. This is all auto-detected from the GitHub event context
-— no configuration needed.
+The action adapts its behavior to the GitHub event context — no configuration
+needed:
+
+- **Default-branch builds** (push to `main`) **never restore**. They publish a
+  fresh full ("base") bundle. Skipping restore here is what keeps the bundle
+  from growing without bound: if it restored and re-saved every run, each save
+  would re-include everything from the restore plus anything new (e.g. after a
+  Gradle upgrade).
+- **Branch / pull-request builds** restore the base bundle (walking history
+  from the **merge-base** of the PR branch and the default branch) and, after
+  the build, publish a **delta** containing only the files that changed.
 
 ### Inputs
 

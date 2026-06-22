@@ -1,4 +1,3 @@
-const fs = require("fs");
 const core = require("@actions/core");
 const exec = require("@actions/exec");
 const {
@@ -9,25 +8,23 @@ const {
   gitDirArgs,
   execOptions,
   resolveBranch,
+  defaultBranch,
+  isDefaultBranchBuild,
 } = require("./helpers");
-
-function defaultBranch() {
-  try {
-    const eventPath = process.env.GITHUB_EVENT_PATH;
-    if (eventPath) {
-      const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
-      if (event.repository && event.repository.default_branch) {
-        return event.repository.default_branch;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return "HEAD";
-}
 
 async function run() {
   try {
+    // Always persist save inputs so the post step runs regardless of restore.
+    core.saveState("cache-key", core.getInput("cache-key"));
+    core.saveState("save", core.getInput("save"));
+
+    if (isDefaultBranchBuild()) {
+      core.info(
+        "Cache restore skipped — default-branch build publishes a fresh base bundle",
+      );
+      return;
+    }
+
     const args = [
       "restore",
       ...commonArgs(),
@@ -51,10 +48,6 @@ async function run() {
     if (exitCode !== 0) {
       core.warning("Cache restore failed; proceeding without cache");
     }
-
-    // Save inputs for the post step
-    core.saveState("cache-key", core.getInput("cache-key"));
-    core.saveState("save", core.getInput("save"));
   } catch (error) {
     core.warning(`Cache restore failed: ${error.message}`);
   }
