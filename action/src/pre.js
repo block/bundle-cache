@@ -1,5 +1,5 @@
-const core = require("@actions/core");
-const { install } = require("./helpers");
+import * as core from "@actions/core";
+import { install } from "./helpers.js";
 
 async function run() {
   try {

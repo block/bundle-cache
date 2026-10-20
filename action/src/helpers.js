@@ -1,9 +1,9 @@
-const core = require("@actions/core");
-const exec = require("@actions/exec");
-const tc = require("@actions/tool-cache");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+import * as tc from "@actions/tool-cache";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 /**
  * Install the gradle-cache binary. Skips download if it's already on PATH.
@@ -176,7 +176,7 @@ function isDefaultBranchBuild() {
   return def !== "HEAD" && refName === def;
 }
 
-module.exports = {
+export {
   install,
   backendArgs,
   commonArgs,
