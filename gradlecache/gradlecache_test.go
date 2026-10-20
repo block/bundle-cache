@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1738,6 +1739,197 @@ func TestS3BundleStoreRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Errorf("got %q, want %q", got, payload)
+	}
+}
+
+func TestS3ParallelDownloadBackpressure(t *testing.T) {
+	const chunkSize = 257
+	const workers = 3
+	const bufferedChunks = 2 * workers
+	payload := make([]byte, 19*chunkSize+37)
+	for i := range payload {
+		payload[i] = byte(i*17 + i/chunkSize)
+	}
+	fs := newFakeS3()
+	fs.objects["test-bucket/key"] = payload
+	requests := make(chan int, 20)
+	laterCompleted := make(chan struct{}, workers-1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var start, end int
+		if n, _ := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); n != 2 {
+			t.Error("missing Range")
+			http.Error(w, "missing Range", http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("If-Match") != `"pinned"` {
+			t.Error("missing If-Match")
+		}
+		requests <- start
+		// Complete later chunks first to exercise ordered delivery and buffer ownership.
+		if start == 0 {
+			for range workers - 1 {
+				select {
+				case <-laterCompleted:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}
+		fs.ServeHTTP(w, r)
+		if start > 0 && start < workers*chunkSize {
+			laterCompleted <- struct{}{}
+		}
+	}))
+	defer srv.Close()
+	client := newTestS3BundleStore(srv).client
+	client.chunkSize, client.dlWorkers = chunkSize, workers
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := client.get(ctx, "test-bucket", "key", s3ObjInfo{Size: int64(len(payload)), ETag: `"pinned"`})
+	must(t, err)
+	defer r.Close() //nolint:errcheck
+	for range bufferedChunks {
+		select {
+		case <-requests:
+		case <-ctx.Done():
+			t.Fatal("initial download window did not start")
+		}
+	}
+	// Without a reader, fetched chunks must consume the entire read-ahead budget.
+	select {
+	case start := <-requests:
+		t.Fatalf("download read ahead beyond %d chunks: range starts at %d", bufferedChunks, start)
+	case <-time.After(100 * time.Millisecond):
+	}
+	got, err := io.ReadAll(r)
+	must(t, err)
+	if !bytes.Equal(got, payload) {
+		t.Fatal("ordered download differs from source")
+	}
+}
+
+func TestS3ParallelDownloadStreamsRange(t *testing.T) {
+	const chunkSize = 257
+	const prefixSize = chunkSize - 1
+	payload := bytes.Repeat([]byte("abc"), chunkSize)
+	fs := newFakeS3()
+	fs.objects["bucket/key"] = payload
+	consumedPrefix := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "bytes=0-256" {
+			fs.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(chunkSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[:prefixSize])
+		w.(http.Flusher).Flush()
+		select {
+		case <-consumedPrefix:
+			_, _ = w.Write(payload[prefixSize:chunkSize])
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	client := newTestS3BundleStore(srv).client
+	client.chunkSize, client.dlWorkers = chunkSize, 2
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := client.get(ctx, "bucket", "key", s3ObjInfo{Size: int64(len(payload))})
+	must(t, err)
+	defer r.Close() //nolint:errcheck
+	prefix := make([]byte, 1)
+	_, err = io.ReadFull(r, prefix)
+	must(t, err)
+	close(consumedPrefix)
+	rest, err := io.ReadAll(r)
+	must(t, err)
+	if !bytes.Equal(append(prefix, rest...), payload) {
+		t.Fatal("streamed download differs from source")
+	}
+}
+
+func TestS3ParallelDownloadInvalidRange(t *testing.T) {
+	const chunkSize = 257
+	for _, tc := range []struct {
+		name    string
+		status  int
+		size    int
+		chunked bool
+	}{
+		{"empty", http.StatusPartialContent, 0, false},
+		{"short", http.StatusPartialContent, chunkSize - 1, false},
+		{"long", http.StatusPartialContent, chunkSize + 1, false},
+		{"chunked-empty", http.StatusPartialContent, 0, true},
+		{"chunked-short", http.StatusPartialContent, chunkSize - 1, true},
+		{"chunked-long", http.StatusPartialContent, chunkSize + 1, true},
+		{"ignored-range", http.StatusOK, chunkSize, false},
+		{"server-error", http.StatusInternalServerError, chunkSize, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.chunked {
+					w.(http.Flusher).Flush()
+				}
+				_, _ = w.Write(make([]byte, tc.size))
+			}))
+			defer srv.Close()
+			client := newTestS3BundleStore(srv).client
+			client.chunkSize, client.dlWorkers = chunkSize, 2
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := client.get(ctx, "bucket", "key", s3ObjInfo{Size: 5 * chunkSize})
+			must(t, err)
+			defer r.Close() //nolint:errcheck
+			if _, err := io.ReadAll(r); err == nil || stderrors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("expected a range error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestS3ParallelDownloadCancellation(t *testing.T) {
+	for _, closeReader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("close=%v", closeReader), func(t *testing.T) {
+			started := make(chan struct{}, 2)
+			stopped := make(chan struct{}, 2)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				<-r.Context().Done()
+				stopped <- struct{}{}
+			}))
+			defer srv.Close()
+			client := newTestS3BundleStore(srv).client
+			client.chunkSize, client.dlWorkers = 257, 2
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			r, err := client.get(ctx, "bucket", "key", s3ObjInfo{Size: 10 * client.chunkSize})
+			must(t, err)
+			defer r.Close() //nolint:errcheck
+			for range client.dlWorkers {
+				select {
+				case <-started:
+				case <-ctx.Done():
+					t.Fatal("requests did not start")
+				}
+			}
+			if closeReader {
+				must(t, r.Close())
+			} else {
+				cancel()
+			}
+			for range client.dlWorkers {
+				select {
+				case <-stopped:
+				case <-time.After(5 * time.Second):
+					t.Fatal("request did not stop")
+				}
+			}
+			if _, err := io.ReadAll(r); err == nil {
+				t.Fatal("cancellation returned success")
+			}
+		})
 	}
 }
 

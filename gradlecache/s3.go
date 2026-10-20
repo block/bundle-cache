@@ -17,10 +17,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alecthomas/errors"
-	"golang.org/x/sync/errgroup"
 )
 
 type awsCreds struct {
@@ -41,6 +41,7 @@ type s3Client struct {
 const (
 	defaultDownloadChunkSize = 32 << 20
 	defaultDownloadWorkers   = 8
+	downloadBlocksPerChunk   = 8
 )
 
 func newS3Client(region string) (*s3Client, error) {
@@ -123,10 +124,12 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) 
 
 	dlCtx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
+	stopCancel := context.AfterFunc(dlCtx, func() { pw.CloseWithError(dlCtx.Err()) })
 	go func() {
 		err := c.parallelGet(dlCtx, bucket, key, info, pw)
-		cancel()
+		stopCancel()
 		pw.CloseWithError(err)
+		cancel()
 	}()
 	return &cancelReadCloser{ReadCloser: pr, cancel: cancel}, nil
 }
@@ -142,17 +145,26 @@ func (c *cancelReadCloser) Close() error {
 }
 
 func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3ObjInfo, w io.Writer) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+
 	numChunks := int((info.Size + c.chunkSize - 1) / c.chunkSize)
 	numWorkers := min(c.dlWorkers, numChunks)
+	blockSize := (c.chunkSize + downloadBlocksPerChunk - 1) / downloadBlocksPerChunk
 
 	type chunkResult struct {
-		data []byte
-		err  error
+		data    []byte
+		recycle chan []byte
+		err     error
 	}
 
 	results := make([]chan chunkResult, numChunks)
 	for i := range results {
-		results[i] = make(chan chunkResult, 1)
+		results[i] = make(chan chunkResult, downloadBlocksPerChunk+1)
 	}
 
 	work := make(chan int, numChunks)
@@ -161,73 +173,101 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3O
 	}
 	close(work)
 
-	eg, egCtx := errgroup.WithContext(ctx)
+	// Stream blocks before a whole range arrives. Each worker retains at most one
+	// chunk plus one block, leased until the ordered writer consumes them. Pools
+	// are worker-local: later chunks cannot take the buffers an earlier one needs.
 	for range numWorkers {
-		eg.Go(func() error {
-			for seq := range work {
-				if egCtx.Err() != nil {
-					results[seq] <- chunkResult{err: egCtx.Err()}
-					continue
-				}
-				start := int64(seq) * c.chunkSize
-				end := min(start+c.chunkSize-1, info.Size-1)
-
-				req, err := http.NewRequestWithContext(egCtx, http.MethodGet, c.objectURL(bucket, key), nil)
-				if err != nil {
-					results[seq] <- chunkResult{err: err}
-					continue
-				}
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-				if info.ETag != "" {
-					req.Header.Set("If-Match", info.ETag)
-				}
-				c.sign(req)
-
-				resp, err := c.http.Do(req) //nolint:gosec
-				if err != nil {
-					results[seq] <- chunkResult{err: err}
-					continue
-				}
-				if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-					msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-					resp.Body.Close() //nolint:errcheck,gosec
-					results[seq] <- chunkResult{err: errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, msg)}
-					continue
-				}
-				data, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close() //nolint:errcheck,gosec
-				results[seq] <- chunkResult{data: data, err: readErr}
+		workers.Go(func() {
+			buffers := make(chan []byte, downloadBlocksPerChunk+1)
+			for range cap(buffers) {
+				buffers <- make([]byte, blockSize)
 			}
-			return nil
+			for seq := range work {
+				err := func() error {
+					var data []byte
+					select {
+					case data = <-buffers:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					start := int64(seq) * c.chunkSize
+					end := min(start+c.chunkSize-1, info.Size-1)
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+					if err != nil {
+						return err
+					}
+					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+					if info.ETag != "" {
+						req.Header.Set("If-Match", info.ETag)
+					}
+					c.sign(req)
+					resp, err := c.http.Do(req) //nolint:gosec
+					if err != nil {
+						return err
+					}
+					defer resp.Body.Close() //nolint:errcheck,gosec
+					if resp.StatusCode != http.StatusPartialContent {
+						msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+						return errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, msg)
+					}
+					if resp.ContentLength >= 0 && resp.ContentLength != end-start+1 {
+						return errors.Errorf("s3 GET range %d-%d: unexpected length %d", start, end, resp.ContentLength)
+					}
+					for remaining := end - start + 1; remaining > 0; {
+						data = data[:min(blockSize, remaining)]
+						if _, err := io.ReadFull(resp.Body, data); err != nil {
+							return errors.Wrap(err, fmt.Sprintf("s3 GET range %d-%d", start, end))
+						}
+						results[seq] <- chunkResult{data: data, recycle: buffers}
+						remaining -= int64(len(data))
+						if remaining > 0 {
+							select {
+							case data = <-buffers:
+							case <-ctx.Done():
+								return ctx.Err()
+							}
+						}
+					}
+					var extra [1]byte
+					if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 {
+						return errors.Errorf("s3 GET range %d-%d: body exceeds requested length", start, end)
+					} else if err != io.EOF {
+						return errors.Wrap(err, fmt.Sprintf("s3 GET range %d-%d", start, end))
+					}
+					return nil
+				}()
+				if err != nil {
+					results[seq] <- chunkResult{err: err}
+					close(results[seq])
+					return
+				}
+				close(results[seq])
+			}
 		})
 	}
 
-	var writeErr error
-	writeDone := make(chan struct{})
-	go func() {
-		defer close(writeDone)
-		for _, ch := range results {
-			r := <-ch
-			if writeErr != nil {
-				continue
+	for _, ch := range results {
+		for {
+			var r chunkResult
+			var ok bool
+			select {
+			case r, ok = <-ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if !ok {
+				break
 			}
 			if r.err != nil {
-				writeErr = r.err
-				continue
+				return r.err
 			}
 			if _, err := w.Write(r.data); err != nil {
-				writeErr = err
+				return err
 			}
+			r.recycle <- r.data[:cap(r.data)]
 		}
-	}()
-
-	egErr := eg.Wait()
-	<-writeDone
-
-	if writeErr != nil {
-		return writeErr
 	}
-	return egErr
+	return nil
 }
 
 func (c *s3Client) objectURL(bucket, key string) string {
