@@ -496,7 +496,7 @@ dependencies { implementation 'com.google.guava:guava:33.4.0-jre' }
 			name:       "kotlin-dsl",
 			fixture:    "gradle-project",
 			dslCacheID: "kotlin-dsl",
-			newBuild: `plugins { kotlin("jvm") version "2.3.20" }
+			newBuild: `plugins { kotlin("jvm") }
 repositories { mavenCentral() }
 dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 `,

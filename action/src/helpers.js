@@ -1,9 +1,9 @@
-const core = require("@actions/core");
-const exec = require("@actions/exec");
-const tc = require("@actions/tool-cache");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+import * as tc from "@actions/tool-cache";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 /**
  * Install the gradle-cache binary. Skips download if it's already on PATH.
@@ -126,12 +126,14 @@ function execOptions(extra) {
  *
  * Explicit `branch` input takes priority. Otherwise, on pull_request events
  * we automatically use GITHUB_HEAD_REF (the PR source branch) so that delta
- * caches work out of the box without any configuration.
+ * caches work out of the box without any configuration. Set `branch` to
+ * "false" to disable delta caching and save a full bundle instead.
  *
  * Returns empty string on push events (default branch builds save full bundles).
  */
 function resolveBranch() {
   const explicit = core.getInput("branch");
+  if (explicit === "false") return "";
   if (explicit) return explicit;
 
   const event = process.env.GITHUB_EVENT_NAME || "";
@@ -176,7 +178,7 @@ function isDefaultBranchBuild() {
   return def !== "HEAD" && refName === def;
 }
 
-module.exports = {
+export {
   install,
   backendArgs,
   commonArgs,

@@ -1,6 +1,6 @@
-const core = require("@actions/core");
-const exec = require("@actions/exec");
-const {
+import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+import {
   backendArgs,
   commonArgs,
   gradleHomeArgs,
@@ -10,7 +10,7 @@ const {
   resolveBranch,
   defaultBranch,
   isDefaultBranchBuild,
-} = require("./helpers");
+} from "./helpers.js";
 
 async function run() {
   try {
