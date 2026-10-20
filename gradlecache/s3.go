@@ -21,6 +21,10 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 type awsCreds struct {
@@ -33,6 +37,7 @@ type s3Client struct {
 	region      string
 	creds       awsCreds
 	http        *http.Client
+	reads       *s3.Client
 	chunkSize   int64
 	dlWorkers   int
 	testBaseURL string
@@ -54,13 +59,36 @@ func newS3Client(region string) (*s3Client, error) {
 		WriteBufferSize:     128 << 10,
 		ReadBufferSize:      128 << 10,
 	}
-	return &s3Client{
+	client := &s3Client{
 		region:    region,
 		creds:     creds,
 		http:      &http.Client{Transport: transport},
 		chunkSize: defaultDownloadChunkSize,
 		dlWorkers: defaultDownloadWorkers,
-	}, nil
+	}
+	client.initReads()
+	return client, nil
+}
+
+func (c *s3Client) initReads() {
+	// Preserve the existing credential resolution and HTTP transport. The SDK
+	// owns signing and retries for reads, not credential refresh or uploads.
+	opts := s3.Options{
+		Region:     c.region,
+		HTTPClient: c.http,
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID: c.creds.AccessKeyID, SecretAccessKey: c.creds.SecretAccessKey,
+				SessionToken: c.creds.SessionToken,
+			}, nil
+		}),
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	}
+	if c.testBaseURL != "" {
+		opts.BaseEndpoint = aws.String(c.testBaseURL)
+		opts.UsePathStyle = true
+	}
+	c.reads = s3.New(opts)
 }
 
 type s3ObjInfo struct {
@@ -70,54 +98,36 @@ type s3ObjInfo struct {
 }
 
 func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
+	resp, err := c.reads.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
 	if err != nil {
 		return s3ObjInfo{}, err
-	}
-	c.sign(req)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return s3ObjInfo{}, err
-	}
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
-	resp.Body.Close()              //nolint:errcheck,gosec
-	if resp.StatusCode != http.StatusOK {
-		return s3ObjInfo{}, errors.Errorf("status %d", resp.StatusCode)
 	}
 	info := s3ObjInfo{
-		Size: resp.ContentLength,
-		ETag: resp.Header.Get("ETag"),
+		Size:     -1,
+		ETag:     aws.ToString(resp.ETag),
+		Metadata: resp.Metadata,
 	}
-	// net/http canonicalizes response header keys, so user metadata always
-	// arrives as "X-Amz-Meta-<name>". Collect it keyed by lowercased name.
-	for k, vs := range resp.Header {
-		name, ok := strings.CutPrefix(k, "X-Amz-Meta-")
-		if !ok || len(vs) == 0 {
-			continue
-		}
-		if info.Metadata == nil {
-			info.Metadata = make(map[string]string)
-		}
-		info.Metadata[strings.ToLower(name)] = vs[0]
+	if resp.ContentLength != nil {
+		info.Size = *resp.ContentLength
 	}
 	return info, nil
 }
 
 func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) (io.ReadCloser, error) {
 	if info.Size <= c.chunkSize {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+		resp, err := c.reads.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+		})
 		if err != nil {
 			return nil, err
 		}
-		c.sign(req)
-		resp, err := c.http.Do(req) //nolint:gosec
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != http.StatusOK {
+		status := awsmiddleware.GetRawResponse(resp.ResultMetadata).(*smithyhttp.Response).StatusCode
+		if status != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close() //nolint:errcheck,gosec
-			return nil, errors.Errorf("s3 GET: status %d: %s", resp.StatusCode, body)
+			return nil, errors.Errorf("s3 GET: status %d: %s", status, body)
 		}
 		return resp.Body, nil
 	}
@@ -192,26 +202,25 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3O
 					}
 					start := int64(seq) * c.chunkSize
 					end := min(start+c.chunkSize-1, info.Size-1)
-					req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
-					if err != nil {
-						return err
+					input := &s3.GetObjectInput{
+						Bucket: aws.String(bucket), Key: aws.String(key),
+						Range: aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 					}
-					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 					if info.ETag != "" {
-						req.Header.Set("If-Match", info.ETag)
+						input.IfMatch = aws.String(info.ETag)
 					}
-					c.sign(req)
-					resp, err := c.http.Do(req) //nolint:gosec
+					resp, err := c.reads.GetObject(ctx, input)
 					if err != nil {
 						return err
 					}
 					defer resp.Body.Close() //nolint:errcheck,gosec
-					if resp.StatusCode != http.StatusPartialContent {
+					status := awsmiddleware.GetRawResponse(resp.ResultMetadata).(*smithyhttp.Response).StatusCode
+					if status != http.StatusPartialContent {
 						msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-						return errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, msg)
+						return errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, status, msg)
 					}
-					if resp.ContentLength >= 0 && resp.ContentLength != end-start+1 {
-						return errors.Errorf("s3 GET range %d-%d: unexpected length %d", start, end, resp.ContentLength)
+					if resp.ContentLength != nil && *resp.ContentLength != end-start+1 {
+						return errors.Errorf("s3 GET range %d-%d: unexpected length %d", start, end, *resp.ContentLength)
 					}
 					for remaining := end - start + 1; remaining > 0; {
 						data = data[:min(blockSize, remaining)]
