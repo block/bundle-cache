@@ -69,7 +69,7 @@ needed:
 |-------|---------|-------------|
 | `cache-key` | `github.job` | Cache key identifying the bundle. Each job gets its own cache by default. |
 | `ref` | repo default branch | Git ref used to search for a base bundle. On PR restores, history walks from the merge-base of `HEAD` and this ref. |
-| `branch` | auto-detected on PRs | Branch name for delta cache support. |
+| `branch` | auto-detected on PRs | Branch name for delta cache support. Set to `"false"` to disable deltas and save a full bundle. |
 | `project-dir` | `.` | Path to the Gradle project root. |
 | `gradle-user-home` | `~/.gradle` | Path to GRADLE_USER_HOME. |
 | `included-build` | | Comma-separated included build paths (e.g. `buildSrc,build-logic`). |

@@ -51991,12 +51991,14 @@ function execOptions(extra) {
  *
  * Explicit `branch` input takes priority. Otherwise, on pull_request events
  * we automatically use GITHUB_HEAD_REF (the PR source branch) so that delta
- * caches work out of the box without any configuration.
+ * caches work out of the box without any configuration. Set `branch` to
+ * "false" to disable delta caching and save a full bundle instead.
  *
  * Returns empty string on push events (default branch builds save full bundles).
  */
 function resolveBranch() {
   const explicit = core.getInput("branch");
+  if (explicit === "false") return "";
   if (explicit) return explicit;
 
   const event = process.env.GITHUB_EVENT_NAME || "";

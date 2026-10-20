@@ -41,6 +41,7 @@ inputs:
       it. When active, restore applies a branch delta concurrently with the
       base bundle, and save-delta runs in the post step instead of a full save.
       On pushes to the default branch, a full bundle is saved automatically.
+      Set to "false" to disable delta caching and save a full bundle on PRs too.
     required: false
   project-dir:
     description: >
