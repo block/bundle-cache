@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1699,11 +1700,13 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func newTestS3BundleStore(server *httptest.Server) *s3BundleStore {
 	client := &s3Client{
 		region:      "us-east-1",
+		creds:       awsCreds{AccessKeyID: "test-id", SecretAccessKey: "test-secret", SessionToken: "test-token"},
 		http:        server.Client(),
 		chunkSize:   defaultDownloadChunkSize,
 		dlWorkers:   defaultDownloadWorkers,
 		testBaseURL: server.URL,
 	}
+	client.initReads()
 	return &s3BundleStore{client: client, bucket: "test-bucket"}
 }
 
@@ -1867,7 +1870,11 @@ func TestS3ParallelDownloadInvalidRange(t *testing.T) {
 		{"server-error", http.StatusInternalServerError, chunkSize, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Range") == "bytes=0-256" {
+					attempts.Add(1)
+				}
 				w.WriteHeader(tc.status)
 				if tc.chunked {
 					w.(http.Flusher).Flush()
@@ -1877,13 +1884,20 @@ func TestS3ParallelDownloadInvalidRange(t *testing.T) {
 			defer srv.Close()
 			client := newTestS3BundleStore(srv).client
 			client.chunkSize, client.dlWorkers = chunkSize, 2
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			r, err := client.get(ctx, "bucket", "key", s3ObjInfo{Size: 5 * chunkSize})
 			must(t, err)
 			defer r.Close() //nolint:errcheck
 			if _, err := io.ReadAll(r); err == nil || stderrors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("expected a range error, got %v", err)
+			}
+			wantAttempts := int32(1)
+			if tc.status == http.StatusInternalServerError {
+				wantAttempts = 3
+			}
+			if attempts.Load() != wantAttempts {
+				t.Fatalf("attempts=%d, want %d (body failures must not resume)", attempts.Load(), wantAttempts)
 			}
 		})
 	}
@@ -1930,6 +1944,81 @@ func TestS3ParallelDownloadCancellation(t *testing.T) {
 				t.Fatal("cancellation returned success")
 			}
 		})
+	}
+}
+
+func TestS3ReadRetries(t *testing.T) {
+	for _, operation := range []string{"head", "get", "range"} {
+		for _, tc := range []struct {
+			name     string
+			status   int
+			failures int32
+			attempts int32
+			wantErr  bool
+		}{
+			{"recover", http.StatusServiceUnavailable, 1, 2, false},
+			{"exhausted", http.StatusServiceUnavailable, 3, 3, true},
+			{"forbidden", http.StatusForbidden, 1, 1, true},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				const chunkSize = 257
+				payload := bytes.Repeat([]byte("abc"), chunkSize)
+				var attempts atomic.Int32
+				server := newFakeS3()
+				server.objects["bucket/path with spaces/+key"] = payload
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !strings.Contains(r.Header.Get("Authorization"), "Credential=test-id/") || r.Header.Get("X-Amz-Security-Token") != "test-token" {
+						t.Error("request did not use the resolved credentials")
+					}
+					// Count attempts for the first range only, not subsequent chunks.
+					if r.Header.Get("Range") == "" || r.Header.Get("Range") == "bytes=0-256" {
+						if attempts.Add(1) <= tc.failures {
+							w.WriteHeader(tc.status)
+							_, _ = io.WriteString(w, "<Error><Code>InjectedFailure</Code></Error>")
+							return
+						}
+					}
+					if r.Method == http.MethodHead {
+						w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+						w.Header().Set("ETag", `"etag"`)
+						w.Header().Set("X-Amz-Meta-Base-Commit", "abc123")
+					}
+					server.ServeHTTP(w, r)
+				}))
+				defer srv.Close()
+				client := newTestS3BundleStore(srv).client
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				var err error
+				if operation == "head" {
+					var info s3ObjInfo
+					info, err = client.stat(ctx, "bucket", "path with spaces/+key")
+					if err == nil && (info.Size != int64(len(payload)) || info.ETag != `"etag"` || info.Metadata["base-commit"] != "abc123") {
+						t.Fatalf("incorrect object metadata: %+v", info)
+					}
+				} else {
+					if operation == "range" {
+						client.chunkSize, client.dlWorkers = chunkSize, 1
+					}
+					var r io.ReadCloser
+					r, err = client.get(ctx, "bucket", "path with spaces/+key", s3ObjInfo{Size: int64(len(payload))})
+					if err == nil {
+						defer r.Close() //nolint:errcheck
+						var got []byte
+						got, err = io.ReadAll(r)
+						if err == nil && !bytes.Equal(got, payload) {
+							t.Fatal("download differs from source")
+						}
+					}
+				}
+				if (err != nil) != tc.wantErr || ctx.Err() != nil {
+					t.Fatalf("error=%v, want error=%v, context=%v", err, tc.wantErr, ctx.Err())
+				}
+				if attempts.Load() != tc.attempts {
+					t.Fatalf("attempts=%d, want %d", attempts.Load(), tc.attempts)
+				}
+			})
+		}
 	}
 }
 
