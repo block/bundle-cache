@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -44,6 +45,44 @@ const (
 	downloadBlocksPerChunk   = 8
 )
 
+// doRequest sends a freshly built and signed request, retrying transient S3
+// server errors before any of the response body is consumed. The final
+// response is returned unchanged so callers can report its status and body.
+func (c *s3Client) doRequest(ctx context.Context, newReq func() (*http.Request, error)) (*http.Response, error) {
+	for attempt, ceiling := 1, 250*time.Millisecond; ; attempt, ceiling = attempt+1, min(2*ceiling, time.Second) {
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+		c.sign(req)
+		resp, err := c.http.Do(req) //nolint:gosec
+		if req.Body != nil {
+			// An early server response can arrive while the transport is still
+			// reading the upload. Stop that reader before the next attempt rewinds.
+			req.Body.Close() //nolint:errcheck,gosec
+		}
+		if err != nil || attempt == 3 {
+			return resp, err
+		}
+		switch resp.StatusCode {
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		default:
+			return resp, nil
+		}
+		// Do not wait for an error body to finish before retrying.
+		resp.Body.Close() //nolint:errcheck,gosec
+		// Equal jitter keeps a minimum pause while spreading concurrent retries.
+		delay := ceiling/2 + time.Duration(rand.Int64N(int64(ceiling/2)+1)) //nolint:gosec // not security-sensitive
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Errorf("retry after status %d: %w", resp.StatusCode, ctx.Err())
+		}
+	}
+}
+
 func newS3Client(region string) (*s3Client, error) {
 	creds, err := resolveAWSCredentials(region)
 	if err != nil {
@@ -70,12 +109,9 @@ type s3ObjInfo struct {
 }
 
 func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
-	if err != nil {
-		return s3ObjInfo{}, err
-	}
-	c.sign(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
+	})
 	if err != nil {
 		return s3ObjInfo{}, err
 	}
@@ -105,12 +141,9 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, err
 
 func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) (io.ReadCloser, error) {
 	if info.Size <= c.chunkSize {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
-		if err != nil {
-			return nil, err
-		}
-		c.sign(req)
-		resp, err := c.http.Do(req) //nolint:gosec
+		resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+			return http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -192,16 +225,17 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3O
 					}
 					start := int64(seq) * c.chunkSize
 					end := min(start+c.chunkSize-1, info.Size-1)
-					req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
-					if err != nil {
-						return err
-					}
-					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-					if info.ETag != "" {
-						req.Header.Set("If-Match", info.ETag)
-					}
-					c.sign(req)
-					resp, err := c.http.Do(req) //nolint:gosec
+					resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+						req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+						if err != nil {
+							return nil, err
+						}
+						req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+						if info.ETag != "" {
+							req.Header.Set("If-Match", info.ETag)
+						}
+						return req, nil
+					})
 					if err != nil {
 						return err
 					}
