@@ -46,7 +46,8 @@ func TestS3DownloadRetries(t *testing.T) {
 			{"forbidden", 403, 1, 1, true},
 			{"missing", 404, 1, 1, true},
 			{"not-implemented", 501, 1, 1, true},
-			{"network", 0, 1, 1, true},
+			{"network", 0, 2, 3, false},
+			{"network-exhausted", 0, 3, 3, true},
 			{"truncated", 200, 0, 1, true},
 		} {
 			if operation == "head" && tc.name == "truncated" {
@@ -69,7 +70,7 @@ func TestS3DownloadRetries(t *testing.T) {
 						first := r.Header.Get("Range") == "" || r.Header.Get("Range") == "bytes=0-63"
 						if first {
 							times = append(times, time.Now())
-							if tc.status == 0 {
+							if tc.status == 0 && len(times) <= tc.failures {
 								return nil, errors.New("network failure")
 							}
 						}
@@ -174,7 +175,8 @@ func TestS3UploadRetries(t *testing.T) {
 			{"recover", 503, 2, 3, false},
 			{"exhausted", 500, 3, 3, true},
 			{"forbidden", 403, 1, 1, true},
-			{"network", 0, 1, 1, true},
+			{"network", 0, 2, 3, false},
+			{"network-exhausted", 0, 3, 3, true},
 		} {
 			t.Run(operation+"/"+tc.name, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
@@ -242,7 +244,7 @@ func TestS3UploadRetries(t *testing.T) {
 								t.Fatalf("completion body changed: %+v", request)
 							}
 						}
-						if tc.status == 0 {
+						if tc.status == 0 && attempts <= tc.failures {
 							return nil, errors.New("network failure")
 						}
 						status, body := 200, ""

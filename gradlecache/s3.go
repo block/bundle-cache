@@ -46,8 +46,9 @@ const (
 )
 
 // doRequest sends a freshly built and signed request, retrying transient S3
-// server errors before any of the response body is consumed. The final
-// response is returned unchanged so callers can report its status and body.
+// server errors and dropped connections before any of the response body is
+// consumed. The final response is returned unchanged so callers can report its
+// status and body.
 func (c *s3Client) doRequest(ctx context.Context, newReq func() (*http.Request, error)) (*http.Response, error) {
 	for attempt, ceiling := 1, 250*time.Millisecond; ; attempt, ceiling = attempt+1, min(2*ceiling, time.Second) {
 		req, err := newReq()
@@ -61,16 +62,22 @@ func (c *s3Client) doRequest(ctx context.Context, newReq func() (*http.Request, 
 			// reading the upload. Stop that reader before the next attempt rewinds.
 			req.Body.Close() //nolint:errcheck,gosec
 		}
-		if err != nil || attempt == 3 {
+		if attempt == 3 {
 			return resp, err
 		}
-		switch resp.StatusCode {
-		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		default:
-			return resp, nil
+		// Transport errors are retried too: S3 closes connections mid-request
+		// under load, and net/http never replays a PUT on its own.
+		retryErr := err
+		if err == nil {
+			switch resp.StatusCode {
+			case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			default:
+				return resp, nil
+			}
+			// Do not wait for an error body to finish before retrying.
+			resp.Body.Close() //nolint:errcheck,gosec
+			retryErr = errors.Errorf("status %d", resp.StatusCode)
 		}
-		// Do not wait for an error body to finish before retrying.
-		resp.Body.Close() //nolint:errcheck,gosec
 		// Equal jitter keeps a minimum pause while spreading concurrent retries.
 		delay := ceiling/2 + time.Duration(rand.Int64N(int64(ceiling/2)+1)) //nolint:gosec // not security-sensitive
 		timer := time.NewTimer(delay)
@@ -78,7 +85,7 @@ func (c *s3Client) doRequest(ctx context.Context, newReq func() (*http.Request, 
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, errors.Errorf("retry after status %d: %w", resp.StatusCode, ctx.Err())
+			return nil, errors.Errorf("retry after %v: %w", retryErr, ctx.Err())
 		}
 	}
 }
