@@ -234,26 +234,55 @@ func crc64Base64(h hash.Hash64) string {
 	return base64.StdEncoding.EncodeToString(buf[:])
 }
 
+// uploadBody leaves the caller's seeker open. Close also waits for an active
+// transport read and rejects future reads, so the seeker can safely be rewound
+// after an early error response even if the transport closes asynchronously.
+type uploadBody struct {
+	mu     sync.Mutex
+	r      io.Reader
+	closed bool
+}
+
+func (b *uploadBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return b.r.Read(p)
+}
+
+func (b *uploadBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
+
 func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string, meta map[string]string) error {
 	checksum, err := crc64Of(r)
 	if err != nil {
 		return errors.Wrap(err, "compute CRC64-NVME checksum")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.objectURL(bucket, key), r)
-	if err != nil {
-		return err
-	}
-	req.ContentLength = size
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
-	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
-	for k, v := range meta {
-		req.Header.Set("X-Amz-Meta-"+k, v)
-	}
-	c.sign(req)
-	resp, err := c.http.Do(req) //nolint:gosec
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.objectURL(bucket, key), &uploadBody{r: r})
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = size
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
+		req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
+		for k, v := range meta {
+			req.Header.Set("X-Amz-Meta-"+k, v)
+		}
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -335,19 +364,20 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 
 func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, contentType string, meta map[string]string) (string, error) {
 	u := c.objectURL(bucket, key) + "?uploads"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
-	if err != nil {
-		return "", err
-	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
-	for k, v := range meta {
-		req.Header.Set("X-Amz-Meta-"+k, v)
-	}
-	c.sign(req)
-	resp, err := c.http.Do(req) //nolint:gosec
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
+		for k, v := range meta {
+			req.Header.Set("X-Amz-Meta-"+k, v)
+		}
+		return req, nil
+	})
 	if err != nil {
 		return "", err
 	}
@@ -382,14 +412,18 @@ func (c *s3Client) uploadPart(ctx context.Context, bucket, key, uploadID string,
 	checksum := crc64Base64(h)
 
 	u := fmt.Sprintf("%s?partNumber=%d&uploadId=%s", c.objectURL(bucket, key), partNum, url.QueryEscape(uploadID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, r)
-	if err != nil {
-		return uploadPartResult{}, err
-	}
-	req.ContentLength = size
-	req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
-	c.sign(req)
-	resp, err := c.http.Do(req) //nolint:gosec
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, &uploadBody{r: r})
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = size
+		req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
+		return req, nil
+	})
 	if err != nil {
 		return uploadPartResult{}, err
 	}
@@ -411,14 +445,15 @@ func (c *s3Client) completeMultipartUpload(ctx context.Context, bucket, key, upl
 		return err
 	}
 	u := fmt.Sprintf("%s?uploadId=%s", c.objectURL(bucket, key), url.QueryEscape(uploadID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(xmlBody)))
-	if err != nil {
-		return err
-	}
-	req.ContentLength = int64(len(xmlBody))
-	req.Header.Set("Content-Type", "application/xml")
-	c.sign(req)
-	resp, err := c.http.Do(req) //nolint:gosec
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(xmlBody))
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = int64(len(xmlBody))
+		req.Header.Set("Content-Type", "application/xml")
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -432,17 +467,17 @@ func (c *s3Client) completeMultipartUpload(ctx context.Context, bucket, key, upl
 
 func (c *s3Client) abortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	u := fmt.Sprintf("%s?uploadId=%s", c.objectURL(bucket, key), url.QueryEscape(uploadID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	resp, err := c.doRequest(ctx, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	})
 	if err != nil {
 		return err
 	}
-	c.sign(req)
-	resp, err := c.http.Do(req) //nolint:gosec
-	if err != nil {
-		return err
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return errors.Errorf("s3 AbortMultipartUpload %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
 	}
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
-	resp.Body.Close()              //nolint:errcheck,gosec
 	return nil
 }
 
