@@ -110,6 +110,11 @@ are archived alongside `$GRADLE_USER_HOME/caches`. Accepts a direct path
 (`buildSrc`, `build-logic`) or a glob (`plugins/*`) to include all
 subdirectories. Defaults to `buildSrc`.
 
+`save` also archives the Gradle distributions in `$GRADLE_USER_HOME/wrapper`
+(without their zips). Pass `--skip-wrapper` to leave them out, for example when
+the CI host already provides the distribution and the bundled copy would be
+discarded.
+
 ### Branch delta cache (PR branches)
 
 For PR builds, pass `--branch` to `restore` to apply a branch delta in the same invocation. The delta bundle is downloaded concurrently with the base extraction so it adds no extra latency:

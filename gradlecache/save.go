@@ -242,6 +242,7 @@ type SaveConfig struct {
 	ProjectDir     string // project directory; defaults to cwd
 	IncludedBuilds []string
 	SkipWarm       bool // skip page cache warming (for benchmarking cold baseline)
+	SkipWrapper    bool // leave $GRADLE_USER_HOME/wrapper (Gradle distributions) out of the bundle
 	Metrics        MetricsClient
 	Logger         *slog.Logger
 }
@@ -306,7 +307,9 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 		return err
 	}
 	sources := []TarSource{{BaseDir: cfg.GradleUserHome, Path: "./caches"}}
-	if fi, err := os.Stat(filepath.Join(cfg.GradleUserHome, "wrapper")); err == nil && fi.IsDir() {
+	if cfg.SkipWrapper {
+		log.Debug("leaving wrapper/ out of the bundle (SkipWrapper=true)")
+	} else if fi, err := os.Stat(filepath.Join(cfg.GradleUserHome, "wrapper")); err == nil && fi.IsDir() {
 		sources = append(sources, TarSource{BaseDir: cfg.GradleUserHome, Path: "./wrapper"})
 	}
 	sources = append(sources, ProjectDirSources(cfg.ProjectDir, cfg.IncludedBuilds)...)
