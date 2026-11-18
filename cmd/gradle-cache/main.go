@@ -170,6 +170,7 @@ type SaveCmd struct {
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory containing included builds and .gradle/." default:"." type:"path"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build"`
+	SkipWrapper    bool     `help:"Leave GRADLE_USER_HOME/wrapper (the Gradle distributions) out of the bundle, e.g. when the CI host provides them." name:"skip-wrapper"`
 }
 
 func (c *SaveCmd) AfterApply() error {
@@ -192,6 +193,7 @@ func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) er
 		GradleUserHome: c.GradleUserHome,
 		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
+		SkipWrapper:    c.SkipWrapper,
 		Metrics:        metrics,
 	})
 }

@@ -996,6 +996,58 @@ func TestSaveErrorsWhenProjectDirDoesNotExist(t *testing.T) {
 	}
 }
 
+func TestSaveSkipWrapper(t *testing.T) {
+	for _, skip := range []bool{false, true} {
+		t.Run(fmt.Sprintf("SkipWrapper=%v", skip), func(t *testing.T) {
+			ctx := context.Background()
+			gradleHome := t.TempDir()
+			must(t, os.MkdirAll(filepath.Join(gradleHome, "caches", "modules-2"), 0o755))
+			must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "modules-2", "dep.jar"), []byte("dep"), 0o644))
+			distDir := filepath.Join(gradleHome, "wrapper", "dists", "gradle-9.9.1-bin", "abc123", "gradle-9.9.1", "lib")
+			must(t, os.MkdirAll(distDir, 0o755))
+			must(t, os.WriteFile(filepath.Join(distDir, "gradle.jar"), []byte("gradle"), 0o644))
+
+			var uploaded bytes.Buffer
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodHead:
+					w.WriteHeader(http.StatusNotFound)
+				case http.MethodPost:
+					_, err := io.Copy(&uploaded, r.Body)
+					must(t, err)
+					w.WriteHeader(http.StatusOK)
+				default:
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer srv.Close()
+
+			must(t, Save(ctx, SaveConfig{
+				CachewURL:      srv.URL,
+				CacheKey:       "test-cache",
+				Commit:         strings.Repeat("a", 40),
+				GradleUserHome: gradleHome,
+				ProjectDir:     t.TempDir(),
+				SkipWarm:       true,
+				SkipWrapper:    skip,
+			}))
+
+			dstDir := t.TempDir()
+			must(t, extractTarZstd(ctx, bytes.NewReader(uploaded.Bytes()), dstDir))
+			if _, err := os.Stat(filepath.Join(dstDir, "caches", "modules-2", "dep.jar")); err != nil {
+				t.Fatalf("expected caches/ in the bundle: %v", err)
+			}
+			_, err := os.Stat(filepath.Join(dstDir, "wrapper", "dists", "gradle-9.9.1-bin", "abc123", "gradle-9.9.1", "lib", "gradle.jar"))
+			if skip && err == nil {
+				t.Fatal("expected wrapper/ to be left out of the bundle")
+			}
+			if !skip && err != nil {
+				t.Fatalf("expected wrapper/ in the bundle: %v", err)
+			}
+		})
+	}
+}
+
 // ─── Delta scan benchmark ─────────────────────────────────────────────────────
 
 // BenchmarkDeltaScan measures the mtime-walk hot path used by SaveDeltaCmd:
